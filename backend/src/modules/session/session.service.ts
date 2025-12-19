@@ -98,6 +98,59 @@ export class SessionService {
     }
   }
 
+  async processAudio(sessionId: string) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new NotFoundException("Session not found");
+    }
+    
+    // 重新创建任务获取新的 meetingJoinUrl（旧的可能已过期）
+    this.logger.log(`Refreshing realtime task for session ${sessionId}...`);
+    const { taskId, meetingJoinUrl } = await this.tingwuService.createRealtimeTask({
+      meetingId: `meeting-${Date.now()}`,
+    });
+    
+    // 更新 session 信息
+    session.taskId = taskId;
+    session.meetingJoinUrl = meetingJoinUrl;
+    this.sessions.set(sessionId, session);
+    
+    // 更新 relay 的 URL
+    this.audioRelayService.updateUrl(sessionId, meetingJoinUrl);
+    
+    // 重新注册轮询
+    this.pollerService.unregisterTask(sessionId);
+    this.pollerService.registerTask(sessionId, taskId, async (payload) => {
+      if (payload.transcription?.length) {
+        const existing = this.transcripts.get(sessionId) ?? [];
+        const map = new Map<string, Transcript>();
+        [...existing, ...payload.transcription].forEach((segment) => {
+          map.set(segment.id, segment);
+        });
+        const merged = Array.from(map.values()).sort(
+          (a, b) => a.startMs - b.startMs
+        );
+        this.transcripts.set(sessionId, merged);
+      }
+      if (payload.summaries?.length) {
+        const existing = this.summaries.get(sessionId) ?? [];
+        const combined = new Map<string, any>();
+        [...existing, ...payload.summaries].forEach((card) => {
+          combined.set(card.id, card);
+        });
+        this.summaries.set(sessionId, Array.from(combined.values()));
+      }
+      if (payload.taskStatus) {
+        this.taskStatuses.set(sessionId, payload.taskStatus);
+      }
+    });
+    
+    this.logger.log(`New task created: ${taskId}`);
+    
+    await this.audioRelayService.processAndSend(sessionId);
+    return { ok: true, taskId };
+  }
+
   async completeSession(sessionId: string) {
     const session = this.sessions.get(sessionId);
     if (!session) {

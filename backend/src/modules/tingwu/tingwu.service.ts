@@ -41,7 +41,7 @@ export class TingwuService {
         type: "realtime",
         input: new CreateTaskRequestInput({
           sourceLanguage: "cn",
-          format: "aac",
+          format: "pcm",
           sampleRate: 16000,
           taskKey: body.meetingId,
         }),

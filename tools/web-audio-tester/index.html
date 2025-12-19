@@ -153,6 +153,9 @@
         </div>
 
         <div class="inline">
+          <button id="processAudioBtn" class="secondary">
+            处理音频
+          </button>
           <button id="completeSessionBtn" class="secondary">
             停止任务
           </button>
@@ -211,6 +214,7 @@
         meetingId: document.getElementById("meetingId"),
         createSessionBtn: document.getElementById("createSessionBtn"),
         completeSessionBtn: document.getElementById("completeSessionBtn"),
+        processAudioBtn: document.getElementById("processAudioBtn"),
         fetchTranscriptsBtn: document.getElementById("fetchTranscriptsBtn"),
         sessionInfo: document.getElementById("sessionInfo"),
         audioFile: document.getElementById("audioFile"),
@@ -290,6 +294,28 @@
         log("正在停止实时任务…", { url });
         await fetch(url, { method: "POST" });
         log("停止请求已发送。");
+      }
+
+      async function processAudio() {
+        if (!state.sessionId) {
+          log("请先创建任务。");
+          return;
+        }
+        const url = `${elements.baseUrl.value
+          .trim()
+          .replace(/\/$/, "")}/sessions/${state.sessionId}/process`;
+        log("正在处理音频并发送到通义听悟…", { url });
+        try {
+          const response = await fetch(url, { method: "POST" });
+          if (response.ok) {
+            log("✅ 音频处理完成！请等待几秒后获取转写结果。");
+          } else {
+            const text = await response.text();
+            log(`❌ 处理失败: ${response.status} ${text}`);
+          }
+        } catch (error) {
+          log("处理音频失败", error);
+        }
       }
 
       async function fetchTranscripts() {
@@ -404,6 +430,14 @@
           await completeSession();
         } catch (error) {
           log("停止任务失败", error);
+        }
+      });
+
+      elements.processAudioBtn.addEventListener("click", async () => {
+        try {
+          await processAudio();
+        } catch (error) {
+          log("处理音频失败", error);
         }
       });
 

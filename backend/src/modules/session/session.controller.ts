@@ -38,6 +38,12 @@ export class SessionController {
     return { ok: true };
   }
 
+  @Post(":id/process")
+  async processAudio(@Param("id") id: string) {
+    await this.sessionService.processAudio(id);
+    return { ok: true };
+  }
+
   @Post(":id/complete")
   async completeSession(@Param("id") id: string) {
     return this.sessionService.completeSession(id);
