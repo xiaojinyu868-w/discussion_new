@@ -13,3 +13,8 @@ export class UploadAudioChunkDto {
   @IsString()
   chunk: string;
 }
+
+export class AskQuestionDto {
+  @IsString()
+  question: string;
+}

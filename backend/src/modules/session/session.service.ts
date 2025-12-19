@@ -1,9 +1,19 @@
-import { Injectable, Logger, NotFoundException } from "@nestjs/common";
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  BadRequestException,
+} from "@nestjs/common";
 import { TingwuService } from "../tingwu/tingwu.service";
 import { CreateSessionDto } from "./session.dto";
 import { v4 as uuid } from "uuid";
 import { PollerService } from "../task-poller/poller.service";
 import { AudioRelayService } from "../tingwu/audio-relay.service";
+import { SkillService, SkillType } from "../skill/skill.service";
+import { AutoPushService } from "../auto-push/auto-push.service";
+import { ContextStoreService } from "../context/context-store.service";
+import { LLMAdapterService } from "../llm/llm-adapter.service";
+import { Express } from "express";
 
 type Transcript = {
   id: string;
@@ -27,7 +37,11 @@ export class SessionService {
   constructor(
     private readonly tingwuService: TingwuService,
     private readonly pollerService: PollerService,
-    private readonly audioRelayService: AudioRelayService
+    private readonly audioRelayService: AudioRelayService,
+    private readonly skillService: SkillService,
+    private readonly autoPushService: AutoPushService,
+    private readonly contextStore: ContextStoreService,
+    private readonly llmAdapter: LLMAdapterService
   ) {}
 
   async createRealtimeSession(body: CreateSessionDto) {
@@ -76,7 +90,7 @@ export class SessionService {
     }
     const buffer = Buffer.from(base64Chunk, "base64");
     try {
-      await this.audioRelayService.write(sessionId, buffer);
+      await this.audioRelayService.ingestWebmChunk(sessionId, buffer);
     } catch (error) {
       const relayError = error as Error;
       if (
@@ -91,7 +105,7 @@ export class SessionService {
           `Audio relay unavailable for session ${sessionId}, attempting to recreate`
         );
         this.audioRelayService.create(sessionId, session.meetingJoinUrl);
-        await this.audioRelayService.write(sessionId, buffer);
+        await this.audioRelayService.ingestWebmChunk(sessionId, buffer);
         return;
       }
       throw relayError;
@@ -99,8 +113,10 @@ export class SessionService {
   }
 
   async processAudio(sessionId: string) {
+    this.logger.log(`=== processAudio called for session ${sessionId} ===`);
     const session = this.sessions.get(sessionId);
     if (!session) {
+      this.logger.error(`Session ${sessionId} not found!`);
       throw new NotFoundException("Session not found");
     }
     
@@ -145,9 +161,11 @@ export class SessionService {
       }
     });
     
-    this.logger.log(`New task created: ${taskId}`);
+    this.logger.log(`New task created: ${taskId}, meetingJoinUrl: ${meetingJoinUrl.slice(0, 50)}...`);
     
+    this.logger.log(`Calling audioRelayService.processAndSend for session ${sessionId}...`);
     await this.audioRelayService.processAndSend(sessionId);
+    this.logger.log(`=== processAudio completed for session ${sessionId} ===`);
     return { ok: true, taskId };
   }
 
@@ -164,6 +182,24 @@ export class SessionService {
   }
 
   async getTranscripts(sessionId: string) {
+    // 优先从 ContextStore 获取（实时转写结果）
+    const contextSegments = this.contextStore.getSegments(sessionId);
+    if (contextSegments.length > 0) {
+      const transcription = contextSegments.map((seg) => ({
+        id: seg.id,
+        speakerId: "speaker-0",
+        startMs: seg.startMs,
+        endMs: seg.endMs,
+        text: seg.text,
+      }));
+      return {
+        sessionId,
+        transcription,
+        taskStatus: this.taskStatuses.get(sessionId),
+      };
+    }
+    
+    // 回退到 transcripts Map（通义听悟轮询结果）
     return {
       sessionId,
       transcription: this.transcripts.get(sessionId) ?? [],
@@ -178,11 +214,73 @@ export class SessionService {
     };
   }
 
-  async triggerSkill(sessionId: string, skill: "inner_os" | "brainstorm") {
+  async triggerSkill(sessionId: string, skill: SkillType) {
     const session = this.sessions.get(sessionId);
     if (!session) {
-      throw new Error("Session not found");
+      throw new NotFoundException("Session not found");
     }
+
+    // 使用新的 SkillService（基于 Qwen3-Max）
+    try {
+      const result = await this.skillService.triggerSkill(sessionId, skill);
+      const cards = this.skillService.toSummaryCards(sessionId, result);
+
+      if (cards.length) {
+        const existing = this.summaries.get(sessionId) ?? [];
+        const combined = new Map<string, any>();
+        [...existing, ...cards].forEach((card) => {
+          combined.set(card.id, card);
+        });
+        this.summaries.set(sessionId, Array.from(combined.values()));
+      }
+
+      return { cards };
+    } catch (error) {
+      this.logger.error(`Skill ${skill} failed: ${error}`);
+      
+      // 如果 LLM 不可用，回退到通义听悟 CustomPrompt（仅支持 inner_os 和 brainstorm）
+      if (skill !== "stop_talking") {
+        this.logger.warn(`Falling back to Tingwu CustomPrompt for ${skill}`);
+        return this.triggerSkillFallback(sessionId, skill as "inner_os" | "brainstorm");
+      }
+      
+      throw error;
+    }
+  }
+
+  async uploadAudioFile(
+    file: Express.Multer.File,
+    meetingId?: string
+  ): Promise<{ sessionId: string; taskId: string }> {
+    if (!file?.buffer || file.size === 0) {
+      throw new BadRequestException("文件为空");
+    }
+
+    const session = await this.createRealtimeSession({
+      meetingId: meetingId ?? `upload-${Date.now()}`,
+    });
+
+    await this.audioRelayService.ingestAudioFile(
+      session.sessionId,
+      file.buffer,
+      file.mimetype?.split("/")?.[1] ?? undefined
+    );
+
+    return { sessionId: session.sessionId, taskId: session.taskId };
+  }
+
+  /**
+   * 回退到通义听悟 CustomPrompt（旧实现）
+   */
+  private async triggerSkillFallback(
+    sessionId: string,
+    skill: "inner_os" | "brainstorm"
+  ) {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new NotFoundException("Session not found");
+    }
+    
     const result = await this.tingwuService.triggerCustomPrompt(
       session.taskId,
       skill
@@ -196,9 +294,7 @@ export class SessionService {
       });
       this.summaries.set(sessionId, Array.from(combined.values()));
     }
-    return {
-      cards,
-    };
+    return { cards };
   }
 
   private normalizeCustomPrompt(
@@ -228,5 +324,114 @@ export class SessionService {
       content: item,
       updatedAt: new Date().toISOString(),
     }));
+  }
+
+  // ===== 自动推送 =====
+
+  async startAutoPush(sessionId: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    this.autoPushService.startAutoAnalysis(sessionId, async (sid, result) => {
+      const card = this.autoPushService.toSummaryCard(sid, result);
+      const existing = this.summaries.get(sid) ?? [];
+      const combined = new Map<string, any>();
+      [...existing, card].forEach((c) => combined.set(c.id, c));
+      this.summaries.set(sid, Array.from(combined.values()));
+      this.logger.log(`Auto push result added for session ${sid}`);
+    });
+
+    return { ok: true, message: "Auto push started" };
+  }
+
+  async stopAutoPush(sessionId: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    this.autoPushService.stopAutoAnalysis(sessionId);
+    return { ok: true, message: "Auto push stopped" };
+  }
+
+  async getAutoPushStatus(sessionId: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    return {
+      sessionId,
+      running: this.autoPushService.isRunning(sessionId),
+      lastAnalysis: this.contextStore.getLastAutoAnalysis(sessionId),
+      meetingPhase: this.contextStore.getMeetingPhase(sessionId),
+    };
+  }
+
+  // ===== 自由问答 =====
+
+  async askQuestion(sessionId: string, question: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    const context = this.contextStore.getFullText(sessionId);
+    if (!context || context.trim().length === 0) {
+      return {
+        answer: "当前没有可用的会议内容，请先开始录音。",
+        messageId: null,
+      };
+    }
+
+    // 保存用户问题到消息流
+    this.contextStore.appendMessage(sessionId, {
+      role: "user",
+      content: question,
+      timestamp: new Date(),
+      type: "qa",
+    });
+
+    const prompt = `你是一个专业的会议助手。基于以下会议内容回答用户的问题。
+
+会议内容：
+${context}
+
+用户问题：${question}
+
+请简洁、准确地回答问题。如果问题与会议内容无关，请礼貌地说明。`;
+
+    try {
+      const answer = await this.llmAdapter.chatWithPrompt(
+        "你是一个专业的会议助手，帮助用户理解和分析会议内容。",
+        prompt,
+        { temperature: 0.7, maxTokens: 1000 }
+      );
+
+      // 保存回答到消息流
+      const messageId = this.contextStore.appendMessage(sessionId, {
+        role: "assistant",
+        content: answer,
+        timestamp: new Date(),
+        type: "qa",
+      });
+
+      return { answer, messageId };
+    } catch (error) {
+      this.logger.error(`QA failed for session ${sessionId}: ${error}`);
+      return {
+        answer: "抱歉，处理问题时出错了，请稍后重试。",
+        messageId: null,
+      };
+    }
+  }
+
+  async getMessages(sessionId: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    return {
+      sessionId,
+      messages: this.contextStore.getMessages(sessionId),
+    };
   }
 }

@@ -48,7 +48,7 @@ export class TingwuService {
         parameters: new CreateTaskRequestParameters({
           transcription: new CreateTaskRequestParametersTranscription({
             outputLevel: 2,
-            diarizationEnabled: true,
+            diarizationEnabled: false,
             diarization:
               new CreateTaskRequestParametersTranscriptionDiarization({
                 speakerCount: 0,

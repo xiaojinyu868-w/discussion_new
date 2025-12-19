@@ -103,10 +103,17 @@ export const useRecorder = (onChunk: (chunk: RecorderChunk) => ChunkHandlerResul
     const { granted } = await Audio.requestPermissionsAsync();
     if (!granted) throw new Error("Microphone permission denied");
 
-    await Audio.setAudioModeAsync({
-      allowsRecordingIOS: true,
-      playsInSilentModeIOS: true,
-    });
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+        staysActiveInBackground: false,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+      });
+    } catch (audioModeError) {
+      console.warn("Failed to set audio mode:", audioModeError);
+    }
 
     const recordingOptions: RecordingOptions = {
       isMeteringEnabled: true,
@@ -136,10 +143,23 @@ export const useRecorder = (onChunk: (chunk: RecorderChunk) => ChunkHandlerResul
     };
 
     const recording = new Audio.Recording();
-    await recording.prepareToRecordAsync(
-      recordingOptions
-    );
-    await recording.startAsync();
+    try {
+      await recording.prepareToRecordAsync(recordingOptions);
+    } catch (prepareError) {
+      console.error("Failed to prepare recording:", prepareError);
+      throw new Error(`录音准备失败: ${prepareError instanceof Error ? prepareError.message : String(prepareError)}`);
+    }
+    
+    try {
+      await recording.startAsync();
+    } catch (startError) {
+      console.error("Failed to start recording:", startError);
+      // 清理已准备的录音对象
+      try {
+        await recording.stopAndUnloadAsync();
+      } catch {}
+      throw new Error(`录音启动失败（模拟器可能不支持麦克风，请使用真机测试）: ${startError instanceof Error ? startError.message : String(startError)}`);
+    }
     recordingRef.current = recording;
     lastByteIndexRef.current = 0;
     startTimeRef.current = Date.now();

@@ -1,16 +1,22 @@
 ﻿import { Injectable, Logger } from "@nestjs/common";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import WS from "ws";
 import ffmpeg from "ffmpeg-static";
+import {
+  ContextStoreService,
+  TingwuTranscriptionPayload,
+} from "../context/context-store.service";
 
 type RelaySession = {
   socket: WS | null;
-  audioBuffer: Buffer[];
   meetingJoinUrl: string;
-  isProcessing: boolean;
+  isConnected: boolean;
+  isStarted: boolean;
+  ffmpegProcess: ChildProcess | null;
+  pcmBuffer: Buffer[]; // 已转码的 PCM 待发送队列
 };
 
 @Injectable()
@@ -18,32 +24,387 @@ export class AudioRelayService {
   private readonly logger = new Logger(AudioRelayService.name);
   private readonly sessions = new Map<string, RelaySession>();
 
+  constructor(private readonly contextStore: ContextStoreService) {}
+
   create(sessionId: string, meetingJoinUrl: string) {
     if (this.sessions.has(sessionId)) {
       return;
     }
     this.logger.log(`Creating audio relay session ${sessionId}`);
 
+    // 初始化上下文存储
+    this.contextStore.initialize(sessionId);
+
     const relay: RelaySession = {
       socket: null,
-      audioBuffer: [],
       meetingJoinUrl,
-      isProcessing: false,
+      isConnected: false,
+      isStarted: false,
+      ffmpegProcess: null,
+      pcmBuffer: [],
     };
 
     this.sessions.set(sessionId, relay);
+    
+    // 立即建立 WebSocket 连接
+    this.connectToTingwu(sessionId, relay);
+  }
+
+  private connectToTingwu(sessionId: string, relay: RelaySession) {
+    this.logger.log(`Connecting to Tingwu WebSocket for session ${sessionId}...`);
+    
+    const socket = new WS(relay.meetingJoinUrl);
+    relay.socket = socket;
+
+    socket.on("open", () => {
+      this.logger.log(`Tingwu WebSocket connected for session ${sessionId}`);
+      relay.isConnected = true;
+
+      // 发送 StartTranscription 命令
+      const startCommand = JSON.stringify({
+        header: {
+          name: "StartTranscription",
+          namespace: "SpeechTranscriber",
+        },
+        payload: {
+          format: "pcm",
+          sample_rate: 16000,
+        },
+      });
+      socket.send(startCommand);
+      this.logger.log(`Sent StartTranscription command for session ${sessionId}`);
+      relay.isStarted = true;
+
+    });
+
+    socket.on("error", (error) => {
+      this.logger.error(`WebSocket error for session ${sessionId}: ${error.message}`);
+      relay.isConnected = false;
+    });
+
+    socket.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        
+        // 检查是否有转写结果
+        if (msg.header?.name === "TranscriptionResultChanged" || 
+            msg.header?.name === "SentenceEnd") {
+          this.logger.log(`[${sessionId}] Transcription: "${msg.payload?.result}"`);
+          
+          // 追加到 ContextStore
+          if (msg.payload) {
+            const payload: TingwuTranscriptionPayload = {
+              result: msg.payload.result ?? "",
+              words: msg.payload.words ?? [],
+              index: msg.payload.index ?? 0,
+              time: msg.payload.time ?? 0,
+              confidence: msg.payload.confidence ?? 0,
+              fixed_result: msg.payload.fixed_result,
+            };
+            this.contextStore.appendFromTingwu(sessionId, payload);
+          }
+        } else if (msg.header?.name === "TranscriptionStarted") {
+          this.logger.log(`[${sessionId}] Transcription started`);
+        } else if (msg.header?.name === "TranscriptionCompleted") {
+          this.logger.log(`[${sessionId}] Transcription completed`);
+        } else if (msg.header?.name === "TaskFailed") {
+          this.logger.error(
+            `[${sessionId}] TaskFailed: ${JSON.stringify({
+              header: msg.header,
+              payload: msg.payload,
+              status: msg.header?.status,
+              status_text: msg.header?.status_text,
+            })}`
+          );
+        } else {
+          this.logger.debug(`[${sessionId}] Tingwu message: ${msg.header?.name}`);
+        }
+      } catch {
+        // 二进制数据，忽略
+      }
+    });
+
+    socket.on("close", (code) => {
+      this.logger.warn(`WebSocket closed for session ${sessionId}, code=${code}`);
+      relay.isConnected = false;
+      relay.isStarted = false;
+    });
+  }
+
+  // 保留空实现以兼容旧调用
+  private async flushPcmBuffer(_sessionId: string, _relay: RelaySession) {
+    return;
   }
 
   async write(sessionId: string, chunk: Buffer) {
+    // 兼容旧调用，直接走实时转码管道
+    await this.ingestWebmChunk(sessionId, chunk);
+  }
+
+  private async convertToPcm(webmChunk: Buffer, sessionId: string): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      const tempDir = os.tmpdir();
+      const inputFile = path.join(tempDir, `${sessionId}-${Date.now()}-input.webm`);
+      const outputFile = path.join(tempDir, `${sessionId}-${Date.now()}-output.pcm`);
+
+      try {
+        fs.writeFileSync(inputFile, webmChunk);
+
+        const args = [
+          "-y",
+          "-f",
+          "webm",
+          "-i",
+          inputFile,
+          "-vn",
+          "-acodec",
+          "pcm_s16le",
+          "-ar",
+          "16000",
+          "-ac",
+          "1",
+          "-f",
+          "s16le",
+          outputFile,
+        ];
+
+        this.logger.debug(
+          `[${sessionId}] ffmpeg start, chunk=${webmChunk.length} bytes, args=${args.join(" ")}`
+        );
+
+        const ffmpegProcess = spawn(ffmpeg ?? "ffmpeg", args);
+
+        let stderr = "";
+        ffmpegProcess.stderr?.on("data", (data) => {
+          stderr += data.toString();
+        });
+
+        ffmpegProcess.on("close", (code) => {
+          try {
+            if (code === 0 && fs.existsSync(outputFile)) {
+              const pcmData = fs.readFileSync(outputFile);
+              if (pcmData.length === 0) {
+                this.logger.warn(
+                  `[${sessionId}] ffmpeg output is empty, chunk=${webmChunk.length} bytes, stderr_tail=${stderr.slice(-200)}`
+                );
+              }
+              resolve(pcmData);
+            } else {
+              this.logger.warn(
+                `[${sessionId}] ffmpeg exited with code ${code}, chunk=${webmChunk.length} bytes, stderr_head=${stderr.slice(0, 400)}, stderr_tail=${stderr.slice(-400)}`
+              );
+              resolve(Buffer.alloc(0));
+            }
+          } finally {
+            // 清理临时文件
+            try {
+              if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+              if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+            } catch {}
+          }
+        });
+
+        ffmpegProcess.on("error", (error) => {
+          try {
+            if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+            if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+          } catch {}
+          reject(error);
+        });
+      } catch (error) {
+        try {
+          if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+          if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+        } catch {}
+        reject(error);
+      }
+    });
+  }
+
+  private startFfmpegStream(sessionId: string, relay: RelaySession) {
+    if (relay.ffmpegProcess) return;
+    const args = [
+      "-loglevel",
+      "error",
+      "-f",
+      "webm",
+      "-i",
+      "pipe:0",
+      "-vn",
+      "-acodec",
+      "pcm_s16le",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-f",
+      "s16le",
+      "pipe:1",
+    ];
+    this.logger.log(`[${sessionId}] start ffmpeg streaming converter`);
+    const proc = spawn(ffmpeg ?? "ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
+    relay.ffmpegProcess = proc;
+
+    proc.stdout?.on("data", async (data: Buffer) => {
+      try {
+        await this.sendPcmData(sessionId, relay, data);
+      } catch (err) {
+        this.logger.warn(`[${sessionId}] send pcm failed: ${err}`);
+      }
+    });
+
+    let stderr = "";
+    proc.stderr?.on("data", (d) => (stderr += d.toString()));
+    proc.on("close", (code) => {
+      this.logger.warn(
+        `[${sessionId}] ffmpeg stream closed code=${code}, stderr_tail=${stderr.slice(-400)}`
+      );
+      relay.ffmpegProcess = null;
+    });
+    proc.on("error", (err) => {
+      this.logger.error(`[${sessionId}] ffmpeg error: ${err.message}`);
+      relay.ffmpegProcess = null;
+    });
+  }
+
+  private async sendPcmData(sessionId: string, relay: RelaySession, pcm: Buffer) {
+    const socket = relay.socket;
+    if (!socket || socket.readyState !== WS.OPEN) return;
+    const chunkSize = 3200; // 100ms @16k mono
+    for (let offset = 0; offset < pcm.length; offset += chunkSize) {
+      const slice = pcm.subarray(offset, offset + chunkSize);
+      socket.send(slice);
+      // 微节流，避免过快推送
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  }
+
+  async ingestWebmChunk(sessionId: string, webmChunk: Buffer) {
     const relay = this.sessions.get(sessionId);
     if (!relay) {
       throw new Error(`Relay not found for session ${sessionId}`);
     }
+    await this.waitForConnection(relay);
+    this.startFfmpegStream(sessionId, relay);
 
-    relay.audioBuffer.push(chunk);
-    this.logger.debug(
-      `Buffered ${chunk.length} bytes for session ${sessionId}, total chunks: ${relay.audioBuffer.length}`
+    if (!relay.ffmpegProcess || !relay.ffmpegProcess.stdin) {
+      throw new Error(`ffmpeg stream not ready for session ${sessionId}`);
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      relay.ffmpegProcess!.stdin!.write(webmChunk, (err) => {
+        if (err) {
+          this.logger.error(`[${sessionId}] ffmpeg stdin write failed: ${err.message}`);
+          return reject(err);
+        }
+        resolve();
+      });
+    });
+  }
+
+  private async waitForConnection(relay: RelaySession, timeoutMs = 5000) {
+    if (relay.isConnected && relay.socket?.readyState === WS.OPEN) return;
+    await new Promise<void>((resolve, reject) => {
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (relay.isConnected && relay.socket?.readyState === WS.OPEN) {
+          clearInterval(timer);
+          resolve();
+        } else if (Date.now() - start > timeoutMs) {
+          clearInterval(timer);
+          reject(new Error("Tingwu socket not ready"));
+        }
+      }, 50);
+    });
+  }
+
+  async ingestPcmBuffer(sessionId: string, pcm: Buffer) {
+    const relay = this.sessions.get(sessionId);
+    if (!relay) throw new Error(`Relay not found for session ${sessionId}`);
+    await this.waitForConnection(relay);
+
+    if (!relay.socket || relay.socket.readyState !== WS.OPEN) {
+      throw new Error(`Socket not open for session ${sessionId}`);
+    }
+
+    const chunkSize = 3200; // 100ms @16k mono s16le
+    this.logger.log(
+      `[${sessionId}] Start sending PCM buffer, total=${pcm.length} bytes`
     );
+    for (let offset = 0; offset < pcm.length; offset += chunkSize) {
+      const slice = pcm.subarray(offset, offset + chunkSize);
+      relay.socket.send(slice);
+      await new Promise((r) => setTimeout(r, 10)); // 放松节流，提高实时性
+    }
+    this.logger.log(
+      `[${sessionId}] Finished sending PCM buffer, chunks=${Math.ceil(
+        pcm.length / chunkSize
+      )}`
+    );
+  }
+
+  async ingestAudioFile(sessionId: string, fileBuffer: Buffer, inputHint?: string) {
+    const relay = this.sessions.get(sessionId);
+    if (!relay) throw new Error(`Relay not found for session ${sessionId}`);
+
+    const tempDir = os.tmpdir();
+    const inputFile = path.join(
+      tempDir,
+      `${sessionId}-${Date.now()}-upload${inputHint ? `.${inputHint}` : ""}`
+    );
+    const outputFile = path.join(tempDir, `${sessionId}-${Date.now()}-upload.pcm`);
+
+    fs.writeFileSync(inputFile, fileBuffer);
+
+    const args = [
+      "-y",
+      "-i",
+      inputFile,
+      "-vn",
+      "-acodec",
+      "pcm_s16le",
+      "-ar",
+      "16000",
+      "-ac",
+      "1",
+      "-f",
+      "s16le",
+      outputFile,
+    ];
+
+    this.logger.log(
+      `[${sessionId}] ffmpeg transcode upload -> pcm, args=${args.join(" ")}`
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(ffmpeg ?? "ffmpeg", args);
+      let stderr = "";
+      proc.stderr?.on("data", (d) => (stderr += d.toString()));
+      proc.on("close", (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          this.logger.error(
+            `[${sessionId}] ffmpeg upload exit ${code}, stderr_tail=${stderr.slice(-400)}`
+          );
+          reject(new Error(`ffmpeg exit ${code}`));
+        }
+      });
+      proc.on("error", (err) => reject(err));
+    });
+
+    if (!fs.existsSync(outputFile)) {
+      throw new Error("PCM output missing after transcode");
+    }
+    const pcm = fs.readFileSync(outputFile);
+    try {
+      await this.ingestPcmBuffer(sessionId, pcm);
+    } finally {
+      try {
+        if (fs.existsSync(inputFile)) fs.unlinkSync(inputFile);
+        if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
+      } catch {}
+    }
   }
 
   updateUrl(sessionId: string, meetingJoinUrl: string) {
@@ -51,216 +412,23 @@ export class AudioRelayService {
     if (relay) {
       relay.meetingJoinUrl = meetingJoinUrl;
       this.logger.log(`Updated meetingJoinUrl for session ${sessionId}`);
+      
+      // 如果已断开，重新连接
+      if (!relay.isConnected) {
+        this.connectToTingwu(sessionId, relay);
+      }
     }
   }
 
+  // 保留旧方法以兼容
   async processAndSend(sessionId: string): Promise<void> {
+    this.logger.log(`processAndSend called for session ${sessionId} (now handled in real-time)`);
+    // 实时模式下，音频已经在 write() 中处理了
+    // 这里只需要确保所有缓冲数据都发送完毕
     const relay = this.sessions.get(sessionId);
-    if (!relay) {
-      throw new Error(`Relay not found for session ${sessionId}`);
+    if (relay) {
+      await this.flushPcmBuffer(sessionId, relay);
     }
-
-    if (relay.audioBuffer.length === 0) {
-      this.logger.warn(`No audio data to process for session ${sessionId}`);
-      return;
-    }
-
-    if (relay.isProcessing) {
-      this.logger.warn(`Already processing audio for session ${sessionId}`);
-      return;
-    }
-
-    relay.isProcessing = true;
-    const fullAudio = Buffer.concat(relay.audioBuffer);
-    this.logger.log(
-      `Processing ${fullAudio.length} bytes of audio for session ${sessionId}`
-    );
-
-    // 将音频写入临时文件（解决 MP4/M4A 需要 seek 的问题）
-    const tempDir = os.tmpdir();
-    const tempInputFile = path.join(tempDir, `${sessionId}-input.tmp`);
-    const tempOutputFile = path.join(tempDir, `${sessionId}-output.pcm`);
-
-    try {
-      // 写入临时文件
-      fs.writeFileSync(tempInputFile, fullAudio);
-      this.logger.log(`Wrote temp file: ${tempInputFile}`);
-
-      // 用 ffmpeg 转码到临时输出文件
-      await this.transcodeWithFfmpeg(tempInputFile, tempOutputFile, sessionId);
-
-      // 读取转码后的 AAC 文件
-      if (!fs.existsSync(tempOutputFile)) {
-        throw new Error("FFmpeg output file not created");
-      }
-
-      const aacData = fs.readFileSync(tempOutputFile);
-      this.logger.log(`Transcoded PCM size: ${aacData.length} bytes`);
-
-      if (aacData.length === 0) {
-        throw new Error("FFmpeg produced empty output");
-      }
-
-      // 建立 WebSocket 连接并发送
-      await this.sendToTingwu(relay, aacData, sessionId);
-    } finally {
-      // 清理临时文件
-      relay.isProcessing = false;
-      try {
-        if (fs.existsSync(tempInputFile)) fs.unlinkSync(tempInputFile);
-        if (fs.existsSync(tempOutputFile)) fs.unlinkSync(tempOutputFile);
-      } catch (e) {
-        this.logger.warn(`Failed to cleanup temp files: ${e}`);
-      }
-    }
-  }
-
-  private transcodeWithFfmpeg(
-    inputFile: string,
-    outputFile: string,
-    sessionId: string
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // 通义听悟实时转写要求：PCM 格式，16kHz，单声道，16bit
-      const ffmpegProcess = spawn(ffmpeg ?? "ffmpeg", [
-        "-y", // 覆盖输出文件
-        "-i",
-        inputFile,
-        "-vn", // 不要视频
-        "-acodec",
-        "pcm_s16le", // PCM 16bit 小端
-        "-ar",
-        "16000", // 16kHz 采样率
-        "-ac",
-        "1", // 单声道
-        "-f",
-        "s16le", // 原始 PCM 格式
-        outputFile,
-      ]);
-
-      let stderr = "";
-
-      ffmpegProcess.stderr?.on("data", (data) => {
-        stderr += data.toString();
-      });
-
-      ffmpegProcess.on("error", (error) => {
-        this.logger.error(`ffmpeg error: ${error.message}`);
-        reject(error);
-      });
-
-      ffmpegProcess.on("close", (code) => {
-        if (code === 0) {
-          this.logger.log(`ffmpeg transcoding completed for ${sessionId}`);
-          resolve();
-        } else {
-          this.logger.error(`ffmpeg stderr: ${stderr}`);
-          reject(new Error(`ffmpeg exited with code ${code}`));
-        }
-      });
-    });
-  }
-
-  private sendToTingwu(
-    relay: RelaySession,
-    pcmData: Buffer,
-    sessionId: string
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const socket = new WS(relay.meetingJoinUrl);
-      relay.socket = socket;
-
-      socket.on("open", () => {
-        this.logger.log(`Tingwu socket open, sending StartTranscription command...`);
-
-        // 1. 先发送 StartTranscription 控制消息
-        const startCommand = JSON.stringify({
-          header: {
-            name: "StartTranscription",
-            namespace: "SpeechTranscriber",
-          },
-          payload: {
-            format: "pcm",
-            sample_rate: 16000,
-          },
-        });
-        socket.send(startCommand);
-        this.logger.log(`Sent StartTranscription command`);
-
-        // 2. 等待一小段时间后开始发送音频数据
-        setTimeout(() => {
-          this.logger.log(`Starting to send ${pcmData.length} bytes of PCM data...`);
-          
-          // 分块发送（每块 1024 字节，每 100ms 发送一次，模拟实时流）
-          const chunkSize = 1024;
-          let offset = 0;
-          let sentBytes = 0;
-
-          const sendNextChunk = () => {
-            if (socket.readyState !== WS.OPEN) {
-              this.logger.warn(`Socket closed during sending, sent ${sentBytes} bytes`);
-              return;
-            }
-
-            if (offset >= pcmData.length) {
-              this.logger.log(`All ${sentBytes} bytes sent to Tingwu`);
-              
-              // 3. 发送 StopTranscription 命令
-              const stopCommand = JSON.stringify({
-                header: {
-                  name: "StopTranscription",
-                  namespace: "SpeechTranscriber",
-                },
-                payload: {},
-              });
-              socket.send(stopCommand);
-              this.logger.log(`Sent StopTranscription command`);
-              
-              // 等待服务端处理完成
-              setTimeout(() => resolve(), 3000);
-              return;
-            }
-
-            const end = Math.min(offset + chunkSize, pcmData.length);
-            const chunk = pcmData.subarray(offset, end);
-
-            socket.send(chunk);
-            sentBytes += chunk.length;
-
-            offset = end;
-
-            // 每 50ms 发送一块（加快速度）
-            setTimeout(sendNextChunk, 50);
-          };
-
-          sendNextChunk();
-        }, 500); // 等待 500ms 让服务端准备好
-      });
-
-      socket.on("error", (error) => {
-        this.logger.error(`Socket error: ${error.message}`);
-        reject(error);
-      });
-
-      socket.on("message", (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          this.logger.log(`Tingwu response: ${JSON.stringify(msg)}`);
-          
-          // 检查是否有转写结果
-          if (msg.header?.name === "TranscriptionResultChanged" || 
-              msg.header?.name === "SentenceEnd") {
-            this.logger.log(`Got transcription: ${JSON.stringify(msg.payload)}`);
-          }
-        } catch {
-          // 二进制数据
-        }
-      });
-
-      socket.on("close", (code, reason) => {
-        this.logger.warn(`Socket closed, code=${code}`);
-      });
-    });
   }
 
   async stop(sessionId: string) {
@@ -268,9 +436,39 @@ export class AudioRelayService {
     if (!relay) return;
     this.logger.log(`Stopping relay for session ${sessionId}`);
 
-    if (relay.socket && relay.socket.readyState === WS.OPEN) {
+    // 停止定时发送
+    if (relay.sendInterval) {
+      clearInterval(relay.sendInterval);
+      relay.sendInterval = null;
+    }
+
+    // 发送最后的数据
+    await this.flushPcmBuffer(sessionId, relay);
+
+    // 结束 ffmpeg 流
+    try {
+      relay.ffmpegProcess?.stdin?.end();
+      relay.ffmpegProcess?.kill('SIGKILL');
+    } catch {}
+
+    // 发送 StopTranscription 命令
+    if (relay.socket && relay.socket.readyState === WS.OPEN && relay.isStarted) {
+      const stopCommand = JSON.stringify({
+        header: {
+          name: "StopTranscription",
+          namespace: "SpeechTranscriber",
+        },
+        payload: {},
+      });
+      relay.socket.send(stopCommand);
+      this.logger.log(`Sent StopTranscription command for session ${sessionId}`);
+      
+      // 等待一会儿让服务端处理完成
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      
       relay.socket.close();
     }
+
     this.sessions.delete(sessionId);
   }
 }

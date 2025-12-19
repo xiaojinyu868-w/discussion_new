@@ -19,13 +19,16 @@ export type SummaryCard = {
     | "qa"
     | "chapter"
     | "inner_os"
-    | "brainstorm";
+    | "brainstorm"
+    | "stop_talking"
+    | "auto_analysis";
   title?: string;
   content: string | string[] | Record<string, unknown>;
   updatedAt: string;
 };
 
 type SkillState = "idle" | "loading" | "success" | "error";
+type SkillName = "inner_os" | "brainstorm" | "stop_talking";
 
 type SessionState = {
   sessionId?: string;
@@ -35,12 +38,12 @@ type SessionState = {
   transcription: SpeakerSegment[];
   summaryCards: SummaryCard[];
   taskStatus?: string;
-  skillState: Record<"inner_os" | "brainstorm", SkillState>;
+  skillState: Record<SkillName, SkillState>;
   setTask: (sessionId: string, taskId: string, meetingJoinUrl: string) => void;
   toggleRecording: (value: boolean) => void;
   appendTranscription: (segments: SpeakerSegment[]) => void;
   upsertSummaryCards: (cards: SummaryCard[]) => void;
-  setSkillState: (skill: "inner_os" | "brainstorm", state: SkillState) => void;
+  setSkillState: (skill: SkillName, state: SkillState) => void;
   setTaskStatus: (status?: string) => void;
   reset: () => void;
 };
@@ -57,6 +60,7 @@ export const useSessionStore = create<SessionState>()(
     skillState: {
       inner_os: "idle",
       brainstorm: "idle",
+      stop_talking: "idle",
     },
     setTask: (sessionId, taskId, meetingJoinUrl) =>
       set({
@@ -117,6 +121,7 @@ export const useSessionStore = create<SessionState>()(
         skillState: {
           inner_os: "idle",
           brainstorm: "idle",
+          stop_talking: "idle",
         },
       }),
   }))

@@ -7,6 +7,8 @@
   RefreshControl,
   Animated,
   Platform,
+  TextInput,
+  Switch,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -18,7 +20,7 @@ import { useRecorder } from "@/hooks/useRecorder";
 import { useAudioUploader } from "@/hooks/useAudioUploader";
 import TranscriptionList from "@/components/TranscriptionList";
 import SummaryList from "@/components/SummaryList";
-import { sessionApi } from "@/api/session";
+import { sessionApi, ChatMessage } from "@/api/session";
 
 const formatDuration = (ms: number) => {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -65,6 +67,10 @@ const HomeScreen = () => {
   const [isRefreshing, setRefreshing] = useState(false);
   const [llmOutput, setLlmOutput] = useState("");
   const [llmError, setLlmError] = useState("");
+  const [autoPushEnabled, setAutoPushEnabled] = useState(false);
+  const [qaQuestion, setQaQuestion] = useState("");
+  const [qaLoading, setQaLoading] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
 
   const stringify = (value: unknown) => {
     if (value instanceof Error) {
@@ -452,6 +458,71 @@ const HomeScreen = () => {
               </Text>
             ) : null}
           </View>
+
+          {/* 自动推送开关 */}
+          <View style={styles.autoPushPanel}>
+            <View style={styles.autoPushRow}>
+              <Text style={styles.autoPushLabel}>自动推送分析</Text>
+              <Switch
+                value={autoPushEnabled}
+                onValueChange={handleAutoPushToggle}
+                trackColor={{ false: colors.backgroundAlt, true: colors.accent }}
+                thumbColor={colors.panel}
+              />
+            </View>
+            <Text style={styles.autoPushHint}>
+              开启后每分钟自动分析会议状态并推送洞察
+            </Text>
+          </View>
+
+          {/* 问答面板 */}
+          <View style={styles.qaPanel}>
+            <Text style={styles.qaPanelTitle}>会议问答</Text>
+            {chatMessages.length > 0 && (
+              <View style={styles.chatList}>
+                {chatMessages.slice(-6).map((msg) => (
+                  <View
+                    key={msg.id}
+                    style={[
+                      styles.chatBubble,
+                      msg.role === "user"
+                        ? styles.chatBubbleUser
+                        : styles.chatBubbleAssistant,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.chatText,
+                        msg.role === "user" && styles.chatTextUser,
+                      ]}
+                    >
+                      {msg.content}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+            <View style={styles.qaInputRow}>
+              <TextInput
+                style={styles.qaInput}
+                placeholder="输入问题，基于会议内容回答..."
+                placeholderTextColor={colors.textMuted}
+                value={qaQuestion}
+                onChangeText={setQaQuestion}
+                onSubmitEditing={handleAskQuestion}
+                editable={!qaLoading}
+              />
+              <TouchableOpacity
+                style={[styles.qaButton, qaLoading && styles.qaButtonDisabled]}
+                onPress={handleAskQuestion}
+                disabled={qaLoading || !qaQuestion.trim()}
+              >
+                <Text style={styles.qaButtonText}>
+                  {qaLoading ? "..." : "发送"}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
         </ScrollView>
 
         <View style={styles.skillPanel}>
@@ -465,13 +536,17 @@ const HomeScreen = () => {
             state={skillState.brainstorm}
             onPress={() => handleSkillTrigger("brainstorm")}
           />
-          <SkillButton label="别再说了" state="idle" onPress={() => {}} />
+          <SkillButton
+            label="别再说了"
+            state={skillState.stop_talking ?? "idle"}
+            onPress={() => handleSkillTrigger("stop_talking")}
+          />
         </View>
       </SafeAreaView>
     </LinearGradient>
   );
 
-  function handleSkillTrigger(skill: "inner_os" | "brainstorm") {
+  function handleSkillTrigger(skill: "inner_os" | "brainstorm" | "stop_talking") {
     if (skillState[skill] === "loading") return;
     useSessionStore.getState().setSkillState(skill, "loading");
     (async () => {
@@ -494,6 +569,71 @@ const HomeScreen = () => {
         }, 2000);
       }
     })();
+  }
+
+  async function handleAutoPushToggle(value: boolean) {
+    if (!sessionId) return;
+    setAutoPushEnabled(value);
+    try {
+      if (value) {
+        await sessionApi.startAutoPush(sessionId);
+        noteResult("自动推送已开启", { sessionId });
+      } else {
+        await sessionApi.stopAutoPush(sessionId);
+        noteResult("自动推送已关闭", { sessionId });
+      }
+    } catch (error) {
+      noteError("自动推送切换失败", error);
+      setAutoPushEnabled(!value);
+    }
+  }
+
+  async function handleAskQuestion() {
+    if (!sessionId || !qaQuestion.trim() || qaLoading) return;
+    setQaLoading(true);
+    const question = qaQuestion.trim();
+    setQaQuestion("");
+    
+    // 添加用户消息到本地
+    setChatMessages((prev) => [
+      ...prev,
+      {
+        id: `local-${Date.now()}`,
+        role: "user",
+        content: question,
+        timestamp: new Date().toISOString(),
+        type: "qa",
+      },
+    ]);
+
+    try {
+      const response = await sessionApi.askQuestion(sessionId, question);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: response.messageId ?? `local-${Date.now()}`,
+          role: "assistant",
+          content: response.answer,
+          timestamp: new Date().toISOString(),
+          type: "qa",
+        },
+      ]);
+      noteResult("问答结果", { question, answer: response.answer });
+    } catch (error) {
+      noteError("问答失败", error);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: `error-${Date.now()}`,
+          role: "assistant",
+          content: "抱歉，处理问题时出错了，请稍后重试。",
+          timestamp: new Date().toISOString(),
+          type: "qa",
+        },
+      ]);
+    } finally {
+      setQaLoading(false);
+    }
   }
 };
 
@@ -801,6 +941,98 @@ const styles = StyleSheet.create({
     ...typography.body,
     fontWeight: "600",
     color: colors.textPrimary,
+  },
+  autoPushPanel: {
+    marginTop: 20,
+    marginHorizontal: 20,
+    padding: 18,
+    borderRadius: 18,
+    backgroundColor: colors.panel,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.panelBorder,
+  },
+  autoPushRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  autoPushLabel: {
+    ...typography.body,
+    fontWeight: "600",
+    color: colors.textPrimary,
+  },
+  autoPushHint: {
+    ...typography.bodySmall,
+    color: colors.textSecondary,
+    marginTop: 8,
+  },
+  qaPanel: {
+    marginTop: 20,
+    marginHorizontal: 20,
+    padding: 18,
+    borderRadius: 18,
+    backgroundColor: colors.panel,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.panelBorder,
+  },
+  qaPanelTitle: {
+    ...typography.subheading,
+    color: colors.textPrimary,
+    marginBottom: 12,
+  },
+  chatList: {
+    marginBottom: 12,
+  },
+  chatBubble: {
+    padding: 12,
+    borderRadius: 14,
+    marginBottom: 8,
+    maxWidth: "85%",
+  },
+  chatBubbleUser: {
+    backgroundColor: colors.accent,
+    alignSelf: "flex-end",
+  },
+  chatBubbleAssistant: {
+    backgroundColor: colors.backgroundAlt,
+    alignSelf: "flex-start",
+  },
+  chatText: {
+    ...typography.body,
+    color: colors.textPrimary,
+  },
+  chatTextUser: {
+    color: colors.accentContrast,
+  },
+  qaInputRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  qaInput: {
+    flex: 1,
+    backgroundColor: colors.backgroundAlt,
+    borderRadius: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    ...typography.body,
+    color: colors.textPrimary,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.panelBorder,
+  },
+  qaButton: {
+    backgroundColor: colors.accent,
+    paddingHorizontal: 20,
+    paddingVertical: 12,
+    borderRadius: 14,
+  },
+  qaButtonDisabled: {
+    opacity: 0.5,
+  },
+  qaButtonText: {
+    ...typography.body,
+    fontWeight: "600",
+    color: colors.accentContrast,
   },
 });
 

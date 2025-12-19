@@ -1,10 +1,25 @@
-import { Body, Controller, Get, Param, Post } from "@nestjs/common";
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Post,
+  UploadedFile,
+  UseInterceptors,
+} from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
 import { SessionService } from "./session.service";
-import { CreateSessionDto, UploadAudioChunkDto } from "./session.dto";
+import { CreateSessionDto, UploadAudioChunkDto, AskQuestionDto } from "./session.dto";
+import { SkillType } from "../skill/skill.service";
 
 @Controller("sessions")
 export class SessionController {
   constructor(private readonly sessionService: SessionService) {}
+
+  @Get("health")
+  async health() {
+    return { ok: true };
+  }
 
   @Post()
   async createSession(@Body() body: CreateSessionDto) {
@@ -24,7 +39,7 @@ export class SessionController {
   @Post(":id/skills/:skillType")
   async triggerSkill(
     @Param("id") id: string,
-    @Param("skillType") skillType: "inner_os" | "brainstorm"
+    @Param("skillType") skillType: SkillType
   ) {
     return this.sessionService.triggerSkill(id, skillType);
   }
@@ -38,6 +53,16 @@ export class SessionController {
     return { ok: true };
   }
 
+  @Post("upload")
+  @UseInterceptors(FileInterceptor("file"))
+  async uploadFile(
+    @UploadedFile() file: Express.Multer.File,
+    @Body("meetingId") meetingId?: string
+  ) {
+    const result = await this.sessionService.uploadAudioFile(file, meetingId);
+    return { ok: true, ...result };
+  }
+
   @Post(":id/process")
   async processAudio(@Param("id") id: string) {
     await this.sessionService.processAudio(id);
@@ -47,5 +72,37 @@ export class SessionController {
   @Post(":id/complete")
   async completeSession(@Param("id") id: string) {
     return this.sessionService.completeSession(id);
+  }
+
+  // ===== 自动推送 API =====
+
+  @Post(":id/auto-push/start")
+  async startAutoPush(@Param("id") id: string) {
+    return this.sessionService.startAutoPush(id);
+  }
+
+  @Post(":id/auto-push/stop")
+  async stopAutoPush(@Param("id") id: string) {
+    return this.sessionService.stopAutoPush(id);
+  }
+
+  @Get(":id/auto-push/status")
+  async getAutoPushStatus(@Param("id") id: string) {
+    return this.sessionService.getAutoPushStatus(id);
+  }
+
+  // ===== 自由问答 API =====
+
+  @Post(":id/qa")
+  async askQuestion(
+    @Param("id") id: string,
+    @Body() body: AskQuestionDto
+  ) {
+    return this.sessionService.askQuestion(id, body.question);
+  }
+
+  @Get(":id/messages")
+  async getMessages(@Param("id") id: string) {
+    return this.sessionService.getMessages(id);
   }
 }
