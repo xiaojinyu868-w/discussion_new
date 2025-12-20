@@ -31,9 +31,10 @@ export class ImageGenerationAdapter {
     this.baseUrl =
       this.configService.get<string>("imageGen.baseUrl") ??
       "https://generativelanguage.googleapis.com/v1beta";
+    // 使用 Gemini Nano Banana 模型（根据文档）
     this.model =
       this.configService.get<string>("imageGen.model") ??
-      "imagen-3.0-generate-001";
+      "gemini-2.5-flash-image";
     this.defaultSize =
       this.configService.get<string>("imageGen.size") ?? "1024x1024";
     this.defaultFormat =
@@ -48,7 +49,9 @@ export class ImageGenerationAdapter {
     }
 
     this.logger.log(
-      `Image Generation Adapter initialized with model: ${this.model}`
+      `Image Generation Adapter initialized with model: ${this.model}, ` +
+      `baseUrl: ${this.baseUrl}, ` +
+      `apiKey configured: ${!!this.apiKey}`
     );
   }
 
@@ -76,33 +79,61 @@ export class ImageGenerationAdapter {
     prompt: string,
     options?: ImageGenerationOptions
   ): Promise<any> {
-    // Google Imagen API调用
-    // 注意：实际API端点可能需要根据Google Cloud配置调整
-    // 如果使用Vertex AI: https://us-central1-aiplatform.googleapis.com/v1/projects/{project}/locations/us-central1/publishers/google/models/imagen-3.0-generate-001:predict
-    // 如果使用REST API: https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-001:generateImages
-    
-    // 当前使用generativelanguage API端点（需要确认实际可用性）
-    const url = `${this.baseUrl}/models/${this.model}:generateImages?key=${this.apiKey}`;
+    // 使用 Gemini API (Nano Banana) 进行图像生成
+    // 参考文档: https://ai.google.dev/gemini-api/docs/image-generation
+    // API 端点格式: https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent
+    const url = `${this.baseUrl}/models/${this.model}:generateContent`;
+
+    // 记录实际请求的 URL（隐藏 API key）
+    const urlForLog = url.replace(/key=[^&]*/, "key=***");
+    this.logger.debug(`Calling Gemini Image API: ${urlForLog}`);
 
     const [width, height] = (options?.size ?? this.defaultSize)
       .split("x")
       .map(Number);
+    const aspectRatio = this.getAspectRatio(width, height);
 
-    const requestBody = {
-      prompt: prompt,
-      number_of_images: 1,
-      aspect_ratio: this.getAspectRatio(width, height),
-      safety_filter_level: "block_some",
-      person_generation: "allow_all",
+    // 根据 Gemini API 文档格式构建请求体
+    const imageConfig: any = {
+      aspectRatio: aspectRatio,
     };
 
-    this.logger.debug(`Calling Imagen API with prompt: ${prompt.substring(0, 100)}...`);
+    // Gemini 3 Pro Image 预览版支持 imageSize 参数（1K, 2K, 4K）
+    if (this.model === "gemini-3-pro-image-preview") {
+      // 根据尺寸推断 imageSize
+      const maxDimension = Math.max(width, height);
+      if (maxDimension >= 3000) {
+        imageConfig.imageSize = "4K";
+      } else if (maxDimension >= 2000) {
+        imageConfig.imageSize = "2K";
+      } else {
+        imageConfig.imageSize = "1K";
+      }
+    }
+
+    const requestBody = {
+      contents: [
+        {
+          parts: [
+            {
+              text: prompt,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        imageConfig: imageConfig,
+      },
+    };
+
+    this.logger.debug(`Calling Gemini Image API with prompt: ${prompt.substring(0, 100)}...`);
 
     try {
       const response = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "x-goog-api-key": this.apiKey, // API key 放在 header 中，而不是 query parameter
         },
         body: JSON.stringify(requestBody),
       });
@@ -110,8 +141,8 @@ export class ImageGenerationAdapter {
       // 检查响应状态
       if (!response.ok) {
         const errorText = await response.text();
-        this.logger.error(`Imagen API error: ${response.status} - ${errorText.substring(0, 500)}`);
-        throw new Error(`Imagen API error: ${response.status} - ${errorText.substring(0, 200)}`);
+        this.logger.error(`Gemini Image API error: ${response.status} - ${errorText.substring(0, 500)}`);
+        throw new Error(`Gemini Image API error: ${response.status} - ${errorText.substring(0, 200)}`);
       }
 
       // 检查 Content-Type，确保是 JSON 响应
@@ -121,13 +152,31 @@ export class ImageGenerationAdapter {
         const responseClone = response.clone();
         const responseText = await responseClone.text();
         this.logger.error(
-          `Imagen API returned non-JSON response. Status: ${response.status}, ` +
-          `Content-Type: ${contentType}, Response preview: ${responseText.substring(0, 500)}`
+          `Gemini Image API returned non-JSON response. Status: ${response.status}, ` +
+          `Content-Type: ${contentType}, URL: ${urlForLog}, Response preview: ${responseText.substring(0, 500)}`
         );
+        
+        // 检查是否是代理服务器返回的 HTML 页面
+        if (responseText.includes("<!doctype html") || responseText.includes("<html")) {
+          this.logger.error(
+            `Detected HTML response from proxy server. ` +
+            `Please check IMAGE_GEN_BASE_URL environment variable. ` +
+            `Expected: https://generativelanguage.googleapis.com/v1beta, ` +
+            `Current: ${this.baseUrl}`
+          );
+          throw new Error(
+            `API endpoint returned HTML instead of JSON. ` +
+            `This usually means IMAGE_GEN_BASE_URL is pointing to a proxy server. ` +
+            `Please set IMAGE_GEN_BASE_URL=https://generativelanguage.googleapis.com/v1beta ` +
+            `or remove it to use the default. Current baseUrl: ${this.baseUrl}`
+          );
+        }
+        
         throw new Error(
-          `Imagen API returned non-JSON response (likely HTML error page). ` +
+          `Gemini Image API returned non-JSON response (likely HTML error page). ` +
           `Status: ${response.status}, Content-Type: ${contentType}. ` +
-          `This may indicate an API endpoint error, authentication failure, or incorrect API configuration.`
+          `This may indicate an API endpoint error, authentication failure, or incorrect API configuration. ` +
+          `Current baseUrl: ${this.baseUrl}`
         );
       }
 
@@ -141,37 +190,69 @@ export class ImageGenerationAdapter {
         // 如果 JSON 解析失败，读取原始响应文本
         const responseText = await responseClone.text();
         this.logger.error(
-          `Failed to parse Imagen API response as JSON. ` +
+          `Failed to parse Gemini Image API response as JSON. ` +
           `Response preview: ${responseText.substring(0, 500)}`
         );
         throw new Error(
-          `Failed to parse Imagen API response as JSON. ` +
+          `Failed to parse Gemini Image API response as JSON. ` +
           `Response may be HTML or invalid JSON. Check API endpoint and authentication. ` +
           `Response preview: ${responseText.substring(0, 200)}`
         );
       }
     } catch (error) {
       // 如果是我们抛出的错误，直接抛出
-      if (error instanceof Error && error.message.includes("Imagen API")) {
+      if (error instanceof Error && (error.message.includes("Gemini Image API") || error.message.includes("Imagen API"))) {
         throw error;
       }
       // 其他错误（网络错误等）
-      this.logger.error(`Failed to call Imagen API: ${error}`);
+      this.logger.error(`Failed to call Gemini Image API: ${error}`);
       throw new Error(
-        `Failed to call Imagen API: ${error instanceof Error ? error.message : String(error)}. ` +
-        `Please check API endpoint (${this.baseUrl}), authentication, and network connectivity.`
+        `Failed to call Gemini Image API: ${error instanceof Error ? error.message : String(error)}. ` +
+        `Please check API endpoint (${url}), authentication, and network connectivity.`
       );
     }
   }
 
   private processResponse(response: any): ImageGenerationResult {
-    // 处理API响应，提取图像Base64数据
-    // Google Imagen API返回格式可能为：
-    // 格式1: { "generatedImages": [{ "imageBytes": "base64_encoded_image", "safetyRatings": [...] }] }
-    // 格式2: { "predictions": [{ "bytesBase64Encoded": "base64_encoded_image" }] } (Vertex AI格式)
-    // 格式3: { "data": { "image": "base64_encoded_image" } }
+    // 处理 Gemini API 响应，提取图像Base64数据
+    // Gemini API 返回格式（根据官方文档）:
+    // {
+    //   "candidates": [{
+    //     "content": {
+    //       "parts": [{
+    //         "inlineData": {
+    //           "data": "base64_encoded_image",
+    //           "mimeType": "image/png"
+    //         }
+    //       }]
+    //     }
+    //   }]
+    // }
     
-    // 尝试格式1
+    // 处理 Gemini API 标准格式
+    if (response.candidates && response.candidates.length > 0) {
+      const candidate = response.candidates[0];
+      if (candidate.content && candidate.content.parts) {
+        for (const part of candidate.content.parts) {
+          if (part.inlineData && part.inlineData.data) {
+            return {
+              base64: part.inlineData.data,
+              metadata: {
+                mimeType: part.inlineData.mimeType || "image/png",
+                finishReason: candidate.finishReason,
+                safetyRatings: candidate.safetyRatings,
+              },
+            };
+          }
+          // 有些响应可能包含文本说明
+          if (part.text) {
+            this.logger.debug(`Gemini API returned text: ${part.text}`);
+          }
+        }
+      }
+    }
+    
+    // 兼容旧格式（如果存在）
     if (response.generatedImages && response.generatedImages.length > 0) {
       const imageData = response.generatedImages[0];
       if (imageData.imageBytes) {
@@ -184,7 +265,7 @@ export class ImageGenerationAdapter {
       }
     }
     
-    // 尝试格式2 (Vertex AI)
+    // 兼容 Vertex AI 格式
     if (response.predictions && response.predictions.length > 0) {
       const prediction = response.predictions[0];
       if (prediction.bytesBase64Encoded) {
@@ -194,17 +275,9 @@ export class ImageGenerationAdapter {
         };
       }
     }
-    
-    // 尝试格式3
-    if (response.data && response.data.image) {
-      return {
-        base64: response.data.image,
-        metadata: response.data,
-      };
-    }
 
-    this.logger.error(`Unexpected response format: ${JSON.stringify(response).substring(0, 200)}`);
-    throw new Error("Invalid response format from Imagen API");
+    this.logger.error(`Unexpected response format: ${JSON.stringify(response).substring(0, 500)}`);
+    throw new Error("Invalid response format from Gemini Image API");
   }
 
   private getAspectRatio(width: number, height: number): string {
