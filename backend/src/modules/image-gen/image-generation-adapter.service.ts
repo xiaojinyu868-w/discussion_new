@@ -107,18 +107,60 @@ export class ImageGenerationAdapter {
         body: JSON.stringify(requestBody),
       });
 
+      // 检查响应状态
       if (!response.ok) {
         const errorText = await response.text();
-        this.logger.error(`Imagen API error: ${response.status} - ${errorText}`);
-        throw new Error(`Imagen API error: ${response.status} - ${errorText}`);
+        this.logger.error(`Imagen API error: ${response.status} - ${errorText.substring(0, 500)}`);
+        throw new Error(`Imagen API error: ${response.status} - ${errorText.substring(0, 200)}`);
       }
 
-      return await response.json();
+      // 检查 Content-Type，确保是 JSON 响应
+      const contentType = response.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        // 克隆响应以便读取文本（响应流只能读取一次）
+        const responseClone = response.clone();
+        const responseText = await responseClone.text();
+        this.logger.error(
+          `Imagen API returned non-JSON response. Status: ${response.status}, ` +
+          `Content-Type: ${contentType}, Response preview: ${responseText.substring(0, 500)}`
+        );
+        throw new Error(
+          `Imagen API returned non-JSON response (likely HTML error page). ` +
+          `Status: ${response.status}, Content-Type: ${contentType}. ` +
+          `This may indicate an API endpoint error, authentication failure, or incorrect API configuration.`
+        );
+      }
+
+      // 在解析 JSON 之前克隆响应，以便解析失败时能读取原始文本
+      const responseClone = response.clone();
+      
+      // 安全地解析 JSON
+      try {
+        return await response.json();
+      } catch (jsonError) {
+        // 如果 JSON 解析失败，读取原始响应文本
+        const responseText = await responseClone.text();
+        this.logger.error(
+          `Failed to parse Imagen API response as JSON. ` +
+          `Response preview: ${responseText.substring(0, 500)}`
+        );
+        throw new Error(
+          `Failed to parse Imagen API response as JSON. ` +
+          `Response may be HTML or invalid JSON. Check API endpoint and authentication. ` +
+          `Response preview: ${responseText.substring(0, 200)}`
+        );
+      }
     } catch (error) {
+      // 如果是我们抛出的错误，直接抛出
+      if (error instanceof Error && error.message.includes("Imagen API")) {
+        throw error;
+      }
+      // 其他错误（网络错误等）
       this.logger.error(`Failed to call Imagen API: ${error}`);
-      // 如果API调用失败，可能需要使用Vertex AI或其他端点
-      // 这里抛出错误，由调用方处理
-      throw error;
+      throw new Error(
+        `Failed to call Imagen API: ${error instanceof Error ? error.message : String(error)}. ` +
+        `Please check API endpoint (${this.baseUrl}), authentication, and network connectivity.`
+      );
     }
   }
 

@@ -20,7 +20,7 @@ export class DataExtractionService {
     chartType: string
   ): Promise<ChartData> {
     const prompt = this.buildExtractionPrompt(context, chartType);
-    const response = await this.llmAdapter.chatForJson([
+    const response = await this.llmAdapter.chatForJson<ChartData>([
       {
         role: "system",
         content: "你是一个数据分析专家，擅长从会议文本中提取结构化数据。",
@@ -31,12 +31,24 @@ export class DataExtractionService {
       },
     ]);
 
-    try {
-      return JSON.parse(response) as ChartData;
-    } catch (error) {
-      this.logger.error("Failed to parse chart data", error);
-      throw new Error("Failed to extract chart data");
+    // chatForJson 已经返回解析后的对象，不需要再次 JSON.parse
+    if (!response) {
+      this.logger.error("LLM returned null or failed to parse JSON");
+      throw new Error("Failed to extract chart data: LLM response is null");
     }
+
+    // 验证返回的数据结构
+    if (!response.type || !response.data) {
+      this.logger.error("Invalid chart data structure", {
+        response,
+        expected: "ChartData with type and data fields",
+      });
+      throw new Error(
+        "Failed to extract chart data: invalid data structure from LLM"
+      );
+    }
+
+    return response as ChartData;
   }
 
   /**
