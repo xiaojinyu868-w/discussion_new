@@ -7,6 +7,7 @@ import { SkillModule } from "../skill/skill.module";
 import { AutoPushModule } from "../auto-push/auto-push.module";
 import { ContextModule } from "../context/context.module";
 import { LLMModule } from "../llm/llm.module";
+import { VisualizationModule } from "../visualization/visualization.module";
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { LLMModule } from "../llm/llm.module";
     AutoPushModule,
     ContextModule,
     LLMModule,
+    VisualizationModule,
   ],
   controllers: [SessionController],
   providers: [SessionService],

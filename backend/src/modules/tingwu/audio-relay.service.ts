@@ -89,17 +89,20 @@ export class AudioRelayService {
         // 检查是否有转写结果
         if (msg.header?.name === "TranscriptionResultChanged" || 
             msg.header?.name === "SentenceEnd") {
-          this.logger.log(`[${sessionId}] Transcription: "${msg.payload?.result}"`);
+          // 实时转写严格模式：只使用原始result，不使用fixed_result
+          // 确保转写结果严格遵循语音输入，不进行自动修正
+          const rawResult = msg.payload?.result ?? "";
+          this.logger.log(`[${sessionId}] Transcription (strict mode): "${rawResult}"`);
           
-          // 追加到 ContextStore
+          // 追加到 ContextStore（严格模式：不使用fixed_result）
           if (msg.payload) {
             const payload: TingwuTranscriptionPayload = {
-              result: msg.payload.result ?? "",
+              result: rawResult, // 严格模式：只使用原始转写结果
               words: msg.payload.words ?? [],
               index: msg.payload.index ?? 0,
               time: msg.payload.time ?? 0,
               confidence: msg.payload.confidence ?? 0,
-              fixed_result: msg.payload.fixed_result,
+              fixed_result: undefined, // 严格模式：不使用修正后的结果
             };
             this.contextStore.appendFromTingwu(sessionId, payload);
           }
@@ -156,7 +159,9 @@ export class AudioRelayService {
           "webm",
           "-i",
           inputFile,
-          "-vn",
+          "-vn", // 禁用视频
+          "-af",
+          this.getAudioEnhancementFilters(), // 应用音频增强滤镜
           "-acodec",
           "pcm_s16le",
           "-ar",
@@ -221,6 +226,26 @@ export class AudioRelayService {
     });
   }
 
+  /**
+   * 获取音频预处理滤镜参数
+   * 用于提高音频质量和转写准确率
+   */
+  private getAudioEnhancementFilters(): string {
+    // 音频增强滤镜链：
+    // 1. highpass: 高通滤波，去除低频噪声（80Hz以下）
+    // 2. lowpass: 低通滤波，去除高频噪声（8000Hz以上，保留语音频段）
+    // 3. anlmdn: 非局部均值降噪，减少背景噪声
+    // 4. loudnorm: 音量归一化，确保音量稳定
+    // 5. volume: 音量增益（如果音频过小）
+    return [
+      "highpass=f=80", // 高通滤波，去除80Hz以下低频噪声
+      "lowpass=f=8000", // 低通滤波，去除8000Hz以上高频噪声（语音主要频段在80-8000Hz）
+      "anlmdn=s=0.0003", // 非局部均值降噪，s参数控制降噪强度（0.0003为中等强度）
+      "loudnorm=I=-16:TP=-1.5:LRA=11", // 音量归一化：目标响度-16 LUFS，真峰值-1.5dB，响度范围11 LU
+      "volume=1.2", // 音量增益20%（如果音频过小可适当提高）
+    ].join(",");
+  }
+
   private startFfmpegStream(sessionId: string, relay: RelaySession) {
     if (relay.ffmpegProcess) return;
     const args = [
@@ -230,7 +255,9 @@ export class AudioRelayService {
       "webm",
       "-i",
       "pipe:0",
-      "-vn",
+      "-vn", // 禁用视频
+      "-af",
+      this.getAudioEnhancementFilters(), // 应用音频增强滤镜
       "-acodec",
       "pcm_s16le",
       "-ar",
@@ -360,7 +387,9 @@ export class AudioRelayService {
       "-y",
       "-i",
       inputFile,
-      "-vn",
+      "-vn", // 禁用视频
+      "-af",
+      this.getAudioEnhancementFilters(), // 应用音频增强滤镜
       "-acodec",
       "pcm_s16le",
       "-ar",

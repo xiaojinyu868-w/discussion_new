@@ -34,25 +34,27 @@ export class TingwuService {
     this.client = new TingwuClient(openApiConfig);
   }
 
-  async createRealtimeTask(body: { meetingId: string; topic?: string }) {
+  async createRealtimeTask(body: { meetingId: string; topic?: string }) {//创建实时转写任务
     try {
       const request = new CreateTaskRequest({
         appKey: this.appKey,
         type: "realtime",
         input: new CreateTaskRequestInput({
-          sourceLanguage: "cn",
+          sourceLanguage: "cn", // 中英文混合模式：保持cn，通义听悟会自动识别中英文混合
           format: "pcm",
-          sampleRate: 16000,
+          sampleRate: 16000, // 通义听悟实时转写API仅支持16000Hz和8000Hz，不支持48000Hz
           taskKey: body.meetingId,
         }),
         parameters: new CreateTaskRequestParameters({
           transcription: new CreateTaskRequestParametersTranscription({
-            outputLevel: 2,
-            diarizationEnabled: false,
+            outputLevel: 2, // 段落级别输出
+            diarizationEnabled: false, // 说话人分离（可根据需要启用）
             diarization:
               new CreateTaskRequestParametersTranscriptionDiarization({
-                speakerCount: 0,
+                speakerCount: 0, // 0表示自动识别说话人数量
               }),
+            // 注意：实时转写采用严格模式，严格遵循语音输入，不进行自动修正
+            // 修正功能仅在总结和分析部分使用
           }),
           summarizationEnabled: true,
           summarization: new CreateTaskRequestParametersSummarization({
@@ -118,19 +120,19 @@ export class TingwuService {
     }
   }
 
-  async triggerCustomPrompt(taskId: string, type: "inner_os" | "brainstorm") {
+  async triggerCustomPrompt(taskId: string, type: "inner_os" | "brainstorm") {//触发自定义提示词
     const prompt =
       type === "inner_os"
         ? {
             Title: "内心OS",
             Prompt:
-              '基于最近2分钟发言，用第一人称生成3条内心独白，输出JSON数组[{ "emotion": "...", "thought": "..." }]',
+              '请根据上下文逻辑，自动修正原文中可能的同音错别字（如将"部署"修正为"部署"）后再进行分析。基于最近2分钟发言，用第一人称生成3条内心独白，输出JSON数组[{ "emotion": "...", "thought": "..." }]',
             ContextWindowMinutes: 2,
           }
         : {
             Title: "头脑风暴",
             Prompt:
-              '结合最近5分钟对话与会议要点，输出不少于3条创意，格式[{ "idea": "...", "rationale": "...", "references": [] }]',
+              '请根据上下文逻辑，自动修正原文中可能的同音错别字（如将"部署"修正为"部署"）后再进行分析。结合最近5分钟对话与会议要点，输出不少于3条创意，格式[{ "idea": "...", "rationale": "...", "references": [] }]',
             ContextWindowMinutes: 5,
           };
 
@@ -167,7 +169,7 @@ export class TingwuService {
     }
   }
 
-  async getTaskSnapshot(taskId: string) {
+  async getTaskSnapshot(taskId: string) {//获取任务快照（转写、摘要、状态）
     try {
       const rawBody = await this.invokeGetTaskInfo(taskId);
       const data = (rawBody?.Data ?? rawBody?.data ?? rawBody ?? {}) as any;
@@ -180,14 +182,35 @@ export class TingwuService {
       if (taskStatus && taskStatus !== "ONGOING") {
         this.logger.debug(`Task ${taskId} current status: ${taskStatus}`);
       }
+      // 提取转写结果，加入置信度过滤（阈值0.6）
       const transcription =
-        data.Transcription?.Paragraphs?.map((item: any) => ({
-          id: item.ParagraphId,
-          speakerId: item.SpeakerId,
-          startMs: item.Words?.[0]?.Start ?? 0,
-          endMs: item.Words?.[item.Words.length - 1]?.End ?? 0,
-          text: item.Words?.map((word: any) => word.Text).join("") ?? "",
-        })) ?? [];
+        data.Transcription?.Paragraphs?.map((item: any) => {
+          // 计算段落平均置信度
+          const words = item.Words ?? [];
+          const avgConfidence =
+            words.length > 0
+              ? words.reduce(
+                  (sum: number, word: any) => sum + (word.Confidence ?? 0),
+                  0
+                ) / words.length
+              : item.Confidence ?? 1.0;
+
+          return {
+            id: item.ParagraphId,
+            speakerId: item.SpeakerId,
+            startMs: item.Words?.[0]?.Start ?? 0,
+            endMs: item.Words?.[item.Words.length - 1]?.End ?? 0,
+            text: item.Words?.map((word: any) => word.Text).join("") ?? "",
+            confidence: avgConfidence, // 添加置信度字段
+            words: words.map((word: any) => ({
+              text: word.Text,
+              startMs: word.Start,
+              endMs: word.End,
+              confidence: word.Confidence ?? 1.0,
+            })), // 添加词级详细信息
+          };
+        })
+          ?.filter((item: any) => item.confidence >= 0.6) ?? []; // 过滤置信度低于0.6的结果
 
       const summaries: any[] = [];
       if (data.Summarization?.Paragraph) {
@@ -245,7 +268,7 @@ export class TingwuService {
     }
   }
 
-  async stopRealtimeTask(taskId: string) {
+  async stopRealtimeTask(taskId: string) {//停止实时转写任务
     try {
       const request = new CreateTaskRequest({
         type: "realtime",

@@ -13,6 +13,7 @@ import { SkillService, SkillType } from "../skill/skill.service";
 import { AutoPushService } from "../auto-push/auto-push.service";
 import { ContextStoreService } from "../context/context-store.service";
 import { LLMAdapterService } from "../llm/llm-adapter.service";
+import { VisualizationService } from "../visualization/visualization.service";
 import { Express } from "express";
 
 type Transcript = {
@@ -41,7 +42,8 @@ export class SessionService {
     private readonly skillService: SkillService,
     private readonly autoPushService: AutoPushService,
     private readonly contextStore: ContextStoreService,
-    private readonly llmAdapter: LLMAdapterService
+    private readonly llmAdapter: LLMAdapterService,
+    private readonly visualizationService: VisualizationService
   ) {}
 
   async createRealtimeSession(body: CreateSessionDto) {
@@ -433,5 +435,67 @@ ${context}
       sessionId,
       messages: this.contextStore.getMessages(sessionId),
     };
+  }
+
+  // ===== 视觉化功能 (V2) =====
+
+  async generateVisualization(
+    sessionId: string,
+    type: "chart" | "creative" | "poster",
+    chartType?: "radar" | "flowchart" | "architecture" | "bar" | "line"
+  ) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    return this.visualizationService.generateVisualization({
+      sessionId,
+      type,
+      chartType,
+    });
+  }
+
+  async getVisualizations(sessionId: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    return {
+      sessionId,
+      visualizations: this.visualizationService.getVisualizations(sessionId),
+    };
+  }
+
+  async getVisualization(sessionId: string, visId: string) {
+    if (!this.sessions.has(sessionId)) {
+      throw new NotFoundException("Session not found");
+    }
+
+    const visualization = this.visualizationService.getVisualization(
+      sessionId,
+      visId
+    );
+    if (!visualization) {
+      throw new NotFoundException("Visualization not found");
+    }
+
+    return visualization;
+  }
+
+  async getVisualizationImage(sessionId: string, visId: string) {
+    const visualization = await this.getVisualization(sessionId, visId);
+
+    if (visualization.imageBase64) {
+      return {
+        imageBase64: visualization.imageBase64,
+        format: "png",
+      };
+    } else if (visualization.imageUrl) {
+      return {
+        imageUrl: visualization.imageUrl,
+      };
+    } else {
+      throw new NotFoundException("Image not found");
+    }
   }
 }

@@ -105,4 +105,39 @@ export class SessionController {
   async getMessages(@Param("id") id: string) {
     return this.sessionService.getMessages(id);
   }
+
+  // ===== 视觉化 API (V2) =====
+
+  @Post(":id/visualization")
+  async generateVisualization(
+    @Param("id") id: string,
+    @Body()
+    body: {
+      type: "chart" | "creative" | "poster";
+      chartType?: "radar" | "flowchart" | "architecture" | "bar" | "line";
+    }
+  ) {
+    return this.sessionService.generateVisualization(id, body.type, body.chartType);
+  }
+
+  @Get(":id/visualizations")
+  async getVisualizations(@Param("id") id: string) {
+    return this.sessionService.getVisualizations(id);
+  }
+
+  @Get(":id/visualizations/:visId")
+  async getVisualization(
+    @Param("id") id: string,
+    @Param("visId") visId: string
+  ) {
+    return this.sessionService.getVisualization(id, visId);
+  }
+
+  @Get(":id/visualizations/:visId/image")
+  async getVisualizationImage(
+    @Param("id") id: string,
+    @Param("visId") visId: string
+  ) {
+    return this.sessionService.getVisualizationImage(id, visId);
+  }
 }

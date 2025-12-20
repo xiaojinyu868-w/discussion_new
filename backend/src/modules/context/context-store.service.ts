@@ -89,10 +89,9 @@ export class ContextStoreService {
         ? payload.words[payload.words.length - 1].endTime
         : payload.time;
 
-    const text =
-      (typeof payload.fixed_result === "string" && payload.fixed_result.trim().length > 0)
-        ? payload.fixed_result
-        : payload.result;
+    // 严格模式：实时转写只使用原始result，不使用fixed_result
+    // 确保转写结果严格遵循语音输入，不进行自动修正
+    const text = payload.result ?? "";
 
     const segment: ContextSegment = {
       id: `seg-${sessionId}-${payload.index}`,
